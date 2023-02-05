@@ -4,6 +4,7 @@ import time
 import typing
 from typing import Union
 
+import backoff
 import requests
 
 from flathunter.abstract_notifier import Notifier
@@ -11,9 +12,33 @@ from flathunter.abstract_processor import Processor
 from flathunter.config import Config
 from flathunter.exceptions import BotBlockedException
 from flathunter.exceptions import UserDeactivatedException
-from flathunter.exceptions import StampedeProtectionException
 from flathunter.logging import logger
 from flathunter.utils.list import chunk_list
+
+
+def get_telegram_backoff(response) -> int:
+    data = response.json()
+
+    default_backoff = 60
+    if "Too Many Requests" in data.get("description", ""):
+        backoff = data.get("parameters", {}).get("retry_after", default_backoff)
+        return backoff
+    return default_backoff
+
+
+def is_too_many_requests_error(response) -> bool:
+    data = response.json()
+    if response.status_code == 429 and "Too Many Requests" in data.get("description", ""):
+        return True
+    return False
+
+
+def on_backoff_fail(backoff_info: dict):
+    logger.error("Failed to backoff Telegram API call, some info: %s", backoff_info)
+
+
+def on_backoff(backoff_info: dict):
+    logger.debug("Backing off Telegram API call, some info: %s", backoff_info)
 
 
 class SenderTelegram(Processor, Notifier):
@@ -85,13 +110,13 @@ class SenderTelegram(Processor, Notifier):
         logger.debug(('chat_id:', chat_id))
         logger.debug(('text:', message))
         logger.debug("Retrieving URL %s, payload %s", self.__text_message_url, payload)
-        response = requests.request("POST", self.__text_message_url, data=payload, timeout=30)
+        response = self.__call_api("POST", self.__text_message_url, data=payload, timeout=30)
         logger.debug("Got response (%i): %s", response.status_code, response.content)
 
         # handle error
         if response.status_code != 200:
             self.__handle_error("When sending bot text message, we got an error.",
-                response, chat_id)
+                                response, chat_id)
             return {}
 
         return response.json().get('result', {})
@@ -117,7 +142,7 @@ class SenderTelegram(Processor, Notifier):
             if msg.get('message_id', None):
                 payload['reply_to_message_id'] = msg.get('message_id')
 
-            response = requests.request("POST", self.__media_group_url, data=payload, timeout=30)
+            response = self.__call_api("POST", self.__media_group_url, data=payload, timeout=30)
 
             if response.status_code != 200:
                 logger.warning("Error sending media group: %s", json.dumps(payload))
@@ -144,21 +169,13 @@ class SenderTelegram(Processor, Notifier):
         status_code = response.status_code
         data = response.json()
 
-        logger.error("%s, status code: %i, data: %s" , msg, status_code, data)
+        logger.error("%s, status code: %i, data: %s", msg, status_code, data)
 
         if response.status_code == 403:
             if "bot was blocked by the user" in data.get("description", ""):
                 raise BotBlockedException(f"User {chat_id} blocked the bot")
             if "user is deactivated" in data.get("description", ""):
                 raise UserDeactivatedException(f"User {chat_id} has been deactivated")
-        if response.status_code == 429:
-            if "Too Many Requests" in data.get("description", ""):
-                backoff = data.get("parameters", {}).get("retry_after", None)
-                if backoff is not None:
-                    time.sleep(min(backoff, 30))
-                    raise StampedeProtectionException(
-                        f"Too many messages too fast - backoff {backoff} seconds"
-                    )
 
     def __get_images(self, expose: typing.Dict) -> typing.List[str]:
         return expose.get("images", [])
@@ -179,3 +196,14 @@ class SenderTelegram(Processor, Notifier):
             address=expose.get('address', 'N/A'),
             durations=expose.get('durations', 'N/A')
         ).strip()
+
+    @backoff.on_predicate(
+        backoff.runtime,
+        value=get_telegram_backoff,
+        predicate=is_too_many_requests_error,
+        on_giveup=on_backoff_fail,
+        on_backoff=on_backoff,
+        max_tries=3,
+    )
+    def __call_api(self, *args, **kwargs):
+        return requests.request(*args, **kwargs)
